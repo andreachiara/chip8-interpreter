@@ -1,4 +1,14 @@
-use rand::random;
+use std::time::{Duration, SystemTime};
+use std::thread::sleep;
+
+use std::fs;
+use std::fs::{File, OpenOptions};
+use std::io;
+use std::io::prelude::*;
+#[cfg(target_family = "unix")]
+use std::os::unix;
+
+use rand::{random, SeedableRng};
 
 struct Memory {
     data: [u8; 4096],
@@ -19,7 +29,29 @@ struct KeyPad {
 }
 
 struct DisplayData {
-    pixels: [[u8; 8]; 16],
+    pixels: [[u8; 8]; 128],
+}
+
+
+impl DisplayData {
+    fn print_display(&self) {
+        for y in 0..128 {
+            for x in 0..8 {
+                for px in 0..8 {
+                    if self.pixels[y][x] & (1 >> px) > 0 {
+                        print!("*");
+                    } else {
+                        print!("x");
+                    }
+                }
+            }
+            println!("");
+        }
+    }
+
+    fn draw(&self) {
+        self.print_display();
+    }
 }
 
 struct StackData {
@@ -48,17 +80,19 @@ impl StackData {
 
 struct Sprite15 {
     data: [u8; 15],
+    width: u8,
 }
 
 struct Sprite5 {
     data: [u8; 5],
+    width: u8,
 }
 
 struct PC {
     c: u16,
 }
 
-const PC_INCR_UNIT: u16 = 1;
+const PC_INCR_UNIT: u16 = 2;
 
 impl PC {
     fn incr(&mut self) {
@@ -75,11 +109,60 @@ impl PC {
     }
 }
 
-const DEFAULT_FONT_SPRITE_0: Sprite5 = { Sprite5 {
-    data: [0xF0, 0x90, 0x90, 0x90, 0xF0],
-}}; //TODO: add the other default font sprites
 
-const FONT_START_MEM_LOCATION: u16 = 0; //TODO: put the font somewhere it makes sense to
+const DEFAULT_FONT: [u8; 80] = [
+    0xF0, 0x90, 0x90, 0x90, 0xF0, //0
+
+
+    0x20, 0x60, 0x20, 0x20, 0x70, //1
+
+
+    0xF0, 0x10, 0xF0, 0x80, 0xF0, //2
+
+
+    0xF0, 0x10, 0xF0, 0x10, 0xF0, //3
+
+
+    0x90, 0x90, 0xF0, 0x10, 0x10, //4
+
+
+    0xF0, 0x80, 0xF0, 0x10, 0xF0, //5
+
+
+    0xF0, 0x80, 0xF0, 0x90, 0xF0, //6
+
+
+    0xF0, 0x10, 0x20, 0x40, 0x40, //7
+
+
+    0xF0, 0x90, 0xF0, 0x90, 0xF0, //8
+
+
+    0xF0, 0x90, 0xF0, 0x10, 0xF0, //9
+
+
+    0xF0, 0x90, 0xF0, 0x90, 0x90, //A
+
+
+    0xE0, 0x90, 0xE0, 0x90, 0xE0, //B
+
+
+    0xF0, 0x80, 0x80, 0x80, 0xF0, //C
+
+
+    0xE0, 0x90, 0x90, 0x90, 0xE0, //D
+
+
+    0xF0, 0x80, 0xF0, 0x80, 0xF0, //E
+
+
+    0xF0, 0x80, 0xF0, 0x80, 0x80, //F
+];
+
+
+
+
+const FONT_START_MEM_LOCATION: u16 = 0x50; //TODO: put the font somewhere it makes sense to
 const FONT_WIDTH_BYTES: u8 = 5; //TODO: put the font somewhere it makes sense to
 
 //fn name(par: type) -> ret
@@ -416,10 +499,59 @@ impl Cpu {
         }
     }
 
+    fn read_opcode(&mut self) {
+        self.opcode[0] = self.mem.data[self.pc.get_cur() as usize];
+        self.opcode[1] = self.mem.data[self.pc.get_cur() as usize + 1];
+    }
+
+    fn tick(&mut self) {
+        self.read_opcode();
+        self.dispatch_operation();
+        self.pc.incr();
+        self.display_mem.draw();
+    }
+
+    fn load_rom(&mut self, rom: Memory){
+        self.mem = rom;
+    }
+
+    fn init_mem(&mut self) {
+        for b in 0..81 {
+            self.mem.data[(FONT_START_MEM_LOCATION + b) as usize] = DEFAULT_FONT[b as usize];
+        }
+    }
+
 
 
 }
 
+fn file_to_rom(file: fs::File) -> Memory {
+    let mut buf: Vec<u8> = ;
+    let mut mem: Memory = Memory {data: [0; 4096]};
+    file.read_to_end(&mut buf);
+    for i in 0..4096 {
+        mem.data[i] = buf[i];
+    }
+    mem
+
+}
+
 fn main() {
-    println!("Hello, world!");
+    let mut mycpu = Cpu {
+        mem: Memory {data: [0; 4096]},
+        gpreg: GPRegisters {v: [0; 16], i: 0},
+        spreg: SPRegisters {d:0, s: 0},
+        stack: StackData {data: [0; 16], pointer: 0},
+        pc: PC {c: 0},
+        opcode: [0; 2],
+        display_mem: DisplayData {pixels: [[0; 8]; 128]},
+        kpad: KeyPad {keys: 0},
+    };
+
+    loop {
+        let begin = SystemTime::now();
+        mycpu.tick();
+        let slp = Duration::from_millis(2);
+        sleep(slp);
+    }
 }
