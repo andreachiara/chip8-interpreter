@@ -15,7 +15,7 @@ struct SPRegisters {
 }
 
 struct KeyPad {
-    keys: [bool; 16],
+    keys: u16,
 }
 
 struct DisplayData {
@@ -90,14 +90,25 @@ struct Cpu {
     spreg: SPRegisters,
     stack: StackData,
     pc: PC,
-    opcode: u16,
+    opcode: [u8; 2],
     display_mem: DisplayData,
     kpad: KeyPad,
 }
 
 impl Cpu {
-    fn inst_cls() { //* CLear Screen CLS
+    fn inst_cls(&mut self) { //* CLear Screen CLS
         println!("CLS");
+        let mut x = 0;
+        let mut y = 0;
+
+        while x < 8 {
+            while y < 16 {
+                self.display_mem.pixels[x][y] = 0;
+                y += 1;
+            }
+            x += 1;
+        }
+
     }
     fn inst_ret(&mut self) { //* RETurn RET
         println!("RET");
@@ -113,8 +124,8 @@ impl Cpu {
             Ok(_cur_stack_ptr) => self.pc.set_as(addr),
         }
     }
-    fn inst_se_byte(&mut self, vreg: usize, byte: u8) { //* Conditional Skip Equal SE
-        if self.gpreg.v[vreg] == byte {
+    fn inst_se_byte(&mut self, vreg_x: usize, byte: u8) { //* Conditional Skip Equal SE
+        if self.gpreg.v[vreg_x] == byte {
             self.pc.incr_n(2);
         }
     }
@@ -123,8 +134,8 @@ impl Cpu {
             self.pc.incr_n(2);
         }
     }
-    fn inst_sne_byte(&mut self, vreg: usize, byte: u8) { //* Conditional Skip Not Equal SNE
-        if self.gpreg.v[vreg] != byte {
+    fn inst_sne_byte(&mut self, vreg_x: usize, byte: u8) { //* Conditional Skip Not Equal SNE
+        if self.gpreg.v[vreg_x] != byte {
             self.pc.incr_n(2);
         }
     }
@@ -145,14 +156,14 @@ impl Cpu {
     fn inst_add_reg(&mut self, vreg_x: usize, vreg_y: usize) { //* ADD reg ADD
         self.gpreg.v[vreg_x] += self.gpreg.v[vreg_y];
     }
-    fn inst_or(&mut self, vreg_x: usize, byte: u8) { //*bitwise OR operator OR
-        self.gpreg.v[vreg_x] |= byte;
+    fn inst_or(&mut self, vreg_x: usize, vreg_y: usize) { //*bitwise OR operator OR
+        self.gpreg.v[vreg_x] |= self.gpreg.v[vreg_y];
     }
-    fn inst_and(&mut self, vreg_x: usize, byte: u8) {
-        self.gpreg.v[vreg_x] &= byte;
+    fn inst_and(&mut self, vreg_x: usize, vreg_y: usize) {
+        self.gpreg.v[vreg_x] &= self.gpreg.v[vreg_y];
     }
-    fn inst_xor(&mut self, vreg_x: usize, byte: u8) {
-        self.gpreg.v[vreg_x] ^= byte;
+    fn inst_xor(&mut self, vreg_x: usize, vreg_y: usize) {
+        self.gpreg.v[vreg_x] ^= self.gpreg.v[vreg_y];
     }
     fn inst_sub(&mut self, vreg_x: usize, vreg_y: usize) {
         if self.gpreg.v[vreg_x] > self.gpreg.v[vreg_y] {
@@ -201,13 +212,27 @@ impl Cpu {
         }
     }
     fn inst_skp(&mut self, vreg_x: usize) { //* Skip Key Pressed
-        if self.kpad.keys[vreg_x] {
+        if self.kpad.keys & (1 << self.gpreg.v[vreg_x]) > 0 {
             self.pc.incr_n(2);
         }
     }
     fn inst_sknp(&mut self, vreg_x: usize) { //* Skip Key Not Pressed
-        if !self.kpad.keys[vreg_x] {
+        if !self.kpad.keys & (1 << self.gpreg.v[vreg_x]) > 0 {
             self.pc.incr_n(2);
+        }
+    }
+    fn inst_ldvdt(&mut self, vreg_x: usize) {
+        self.gpreg.v[vreg_x] = self.spreg.d;
+    }
+    fn inst_ldk(&mut self, vreg_x: usize) {
+        let init_keys = self.kpad.keys;
+        while self.kpad.keys == init_keys {}
+        let mut it = 0;
+        while it < 16 {
+            if (self.kpad.keys >> it) > 0 {
+                self.gpreg.v[vreg_x] = it;
+                break;
+            }
         }
     }
     fn inst_lddt(&mut self, vreg_x: usize) { //* LoaD reg in Delay Timer LDDT
@@ -237,6 +262,157 @@ impl Cpu {
         let mut it = 0;
         while it <= vreg_x {
             self.gpreg.v[it] = self.mem.data[(self.gpreg.i as usize) + it];
+        }
+    }
+
+    fn dispatch_operation(&mut self) {
+
+        //? SUS: check endianness sigh
+        let opcode_digits_hex: [u8; 4] = [
+            self.opcode[0] & 0xF0 / 0x10,   //* Dxxx */
+            self.opcode[0] & 0x0F,          //* xDxx */
+            self.opcode[1] & 0xF0 / 0x10,   //* xxDx */
+            self.opcode[1] & 0x0F,          //* xxxD */
+        ];
+
+        let opcode_as_u16: u16 = (self.opcode[0] as u16 * 0x100) + (self.opcode[1] as u16);
+
+        let vreg_x = opcode_digits_hex[1] as usize;
+        let vreg_y = opcode_digits_hex[2] as usize;
+        let byte = self.opcode[1];
+        let addr = opcode_as_u16 % 0x1000;
+        let nibble = opcode_digits_hex[3];
+
+
+
+
+        match opcode_digits_hex[0] {
+            0x0 => {
+                if opcode_as_u16 == 0x00E0 {
+                    println!("CLS opcode");
+                    self.inst_cls();
+                } else if opcode_as_u16 == 0x00EE {
+                    self.inst_ret();
+                }
+            },
+            0x1 => {
+                self.inst_jp(addr);
+            },
+            0x2 => {
+                self.inst_call(addr);
+            },
+            0x3 => {
+                self.inst_se_byte(vreg_x, byte);
+            },
+            0x4 => {
+                self.inst_sne_byte(vreg_x, byte);
+            },
+            0x5 => {
+                if opcode_digits_hex[3] == 0 {
+                    self.inst_se_reg(vreg_x, vreg_y);
+                }
+            },
+            0x6 => {
+                self.inst_ld_byte(vreg_x, byte);
+            },
+            0x7 => {
+                self.inst_add_byte(vreg_x, byte);
+            },
+            0x8 => {
+                match opcode_digits_hex[3] {
+                    0x0 => {
+                        self.inst_ld_reg(vreg_x, vreg_y);
+                    },
+                    0x1 => {
+                        self.inst_or(vreg_x, vreg_y);
+                    },
+                    0x2 => {
+                        self.inst_and(vreg_x, vreg_y);
+                    },
+                    0x3 => {
+                        self.inst_xor(vreg_x, vreg_y);
+                    },
+                    0x4 => {
+                        self.inst_add_reg(vreg_x, vreg_y);
+                    },
+                    0x5 => {
+                        self.inst_sub(vreg_x, vreg_y);
+                    },
+                    0x6 => {
+                        self.inst_shr(vreg_x);
+                    },
+                    0x7 => {
+                        self.inst_subn(vreg_x, vreg_y);
+                    },
+                    0xE => {
+                        self.inst_shl(vreg_x);
+                    },
+                    _ => {
+                        println!("UNRECOGNISED OPCODE 0x{}", opcode_as_u16)
+                    }
+                }
+            },
+            0x9 => {
+                if opcode_digits_hex[3] == 0 {
+                    self.inst_sne_reg(vreg_x, vreg_y);
+                }
+            },
+            0xA => {
+                self.inst_ldi(addr);
+            },
+            0xB => {
+                self.inst_jpv0(addr);
+            },
+            0xC => {
+                self.inst_rnd(vreg_x, byte);
+            },
+            0xD => {
+                self.inst_drw(vreg_x, vreg_y, nibble);
+            },
+            0xE => {
+                if self.opcode[1] == 0x9E {
+                    self.inst_skp(vreg_x);
+                } else if self.opcode[1] == 0xA1 {
+                    self.inst_sknp(vreg_x);
+                }
+            },
+            0xF => {
+                match self.opcode[1] {
+                    0x07 => {
+                        self.inst_ldvdt(vreg_x);
+                    },
+                    0x0A => {
+                        self.inst_ldk(vreg_x);
+                    },
+                    0x15 => {
+                        self.inst_lddt(vreg_x);
+                    },
+                    0x18 => {
+                        self.inst_ldst(vreg_x);
+                    },
+                    0x1E => {
+                        self.inst_addi(vreg_x, vreg_y);
+                    },
+                    0x29 => {
+                        self.inst_ldf(vreg_x);
+                    },
+                    0x33 => {
+                        self.inst_ldb(vreg_x);
+                    },
+                    0x55 => {
+                        self.inst_ldtm(vreg_x);
+                    },
+                    0x65 => {
+                        self.inst_ldtm(vreg_x);
+                    },
+                    _ => {
+                        println!("UNRECOGNISED OPCODE 0x{}", opcode_as_u16)
+                    }
+                }
+            },
+            _ => {
+                println!("UNRECOGNISED OPCODE 0x{}", opcode_as_u16)
+            }
         }
     }
 
