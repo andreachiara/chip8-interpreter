@@ -1,14 +1,27 @@
+use std::ops::BitXorAssign;
 use std::time::{Duration, SystemTime};
 use std::thread::sleep;
 
+use std::env;
+
 use std::fs;
-use std::fs::{File, OpenOptions};
 use std::io;
-use std::io::prelude::*;
 #[cfg(target_family = "unix")]
 use std::os::unix;
 
+use std::io::Write;
+use std::process;
+
+
 use rand::{random, SeedableRng};
+
+use crossterm::{
+    ExecutableCommand, QueueableCommand,
+    terminal, cursor, style::{self, Stylize},
+    Command, event::{poll, read, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
+    queue,
+    terminal::{disable_raw_mode, enable_raw_mode},
+};
 
 struct Memory {
     data: [u8; 4096],
@@ -28,29 +41,60 @@ struct KeyPad {
     keys: u16,
 }
 
-struct DisplayData {
-    pixels: [[u8; 8]; 128],
-}
 
+const SCREEN_HEIGHT: u8 = 32;
+const SCREEN_WIDTH: u8 = 64;
+
+struct DisplayData {
+    pixels: [[bool; SCREEN_WIDTH as usize]; SCREEN_HEIGHT as usize],
+}
 
 impl DisplayData {
     fn print_display(&self) {
-        for y in 0..128 {
-            for x in 0..8 {
-                for px in 0..8 {
-                    if self.pixels[y][x] & (1 >> px) > 0 {
-                        print!("*");
-                    } else {
-                        print!("x");
-                    }
+        for y in 0..SCREEN_HEIGHT {
+            for x in 0..SCREEN_WIDTH {
+                if self.pixels[y as usize][x as usize] {
+                    print!("[]");
+                } else {
+                    print!("  ");
                 }
+                //print!(" ({:x},{:x}) ",x, y);
+                //print!("{:8b}", self.pixels[y][x]);
             }
             println!("");
         }
+        println!("==========================================================");
+
+    }
+
+    fn crossterm_draw(&self) {
+        let mut stdout = io::stdout();
+
+        let mut scr: String = "".to_string();
+
+        for y in 0..SCREEN_HEIGHT {
+            let mut line: String = "".to_string();
+            for x in 0..SCREEN_WIDTH {
+
+                if self.pixels[y as usize][x as usize] {
+                    line.push_str("██");
+                    //queue!(stdout, cursor::MoveTo(x,y), style::PrintStyledContent( "█".magenta()));
+                } else {
+                    line.push_str("  ");
+                }
+            }
+            scr.push_str(&line);
+            scr.push_str("\n");
+
+        }
+        stdout.execute(terminal::Clear(terminal::ClearType::All));
+        queue!(stdout, cursor::MoveTo(0, 0), style::PrintStyledContent(scr.blue()));
+        stdout.flush();
     }
 
     fn draw(&self) {
-        self.print_display();
+        //self.print_display();
+        self.crossterm_draw();
     }
 }
 
@@ -176,55 +220,55 @@ struct Cpu {
     opcode: [u8; 2],
     display_mem: DisplayData,
     kpad: KeyPad,
+    kpad_old: KeyPad,
+    no_pc_incr: bool,
 }
 
 impl Cpu {
     fn inst_cls(&mut self) { //* CLear Screen CLS
-        println!("CLS");
-        let mut x = 0;
-        let mut y = 0;
+        //println!("CLS");
 
-        while x < 8 {
-            while y < 16 {
-                self.display_mem.pixels[x][y] = 0;
-                y += 1;
+        for y in 0..SCREEN_HEIGHT {
+            for x in 0..SCREEN_WIDTH {
+                self.display_mem.pixels[y as usize][x as usize] = false;
             }
-            x += 1;
         }
 
     }
     fn inst_ret(&mut self) { //* RETurn RET
-        println!("RET");
+        //println!("RET");
         self.pc.set_as(self.stack.pop());
     }
     fn inst_jp(&mut self, addr: u16) { //* JumP JP
-        println!("JP");
+        //println!("JP");
         self.pc.set_as(addr);
+        self.no_pc_incr = true;
     }
     fn inst_call(&mut self, addr: u16) { //* CALL subroutine CALL
         match self.stack.push(self.pc.get_cur()) { //? Check that we don't have to increment PC before doing this bc it seems sus
             Err(_cur_stack_ptr) => println!("FATAL: the stack is full"),
             Ok(_cur_stack_ptr) => self.pc.set_as(addr),
         }
+        self.no_pc_incr = true;
     }
     fn inst_se_byte(&mut self, vreg_x: usize, byte: u8) { //* Conditional Skip Equal SE
         if self.gpreg.v[vreg_x] == byte {
-            self.pc.incr_n(2);
+            self.pc.incr_n(1);
         }
     }
     fn inst_se_reg(&mut self, vreg_x: usize, vreg_y: usize) { //* Conditional Skip Equal SE
         if self.gpreg.v[vreg_x] == self.gpreg.v[vreg_y]  {
-            self.pc.incr_n(2);
+            self.pc.incr_n(1);
         }
     }
     fn inst_sne_byte(&mut self, vreg_x: usize, byte: u8) { //* Conditional Skip Not Equal SNE
         if self.gpreg.v[vreg_x] != byte {
-            self.pc.incr_n(2);
+            self.pc.incr_n(1);
         }
     }
     fn inst_sne_reg(&mut self, vreg_x: usize, vreg_y: usize) { //* Conditional Skip Not Equal SNE
         if self.gpreg.v[vreg_x] != self.gpreg.v[vreg_y]  {
-            self.pc.incr_n(2);
+            self.pc.incr_n(1);
         }
     }
     fn inst_ld_byte(&mut self, vreg_x: usize, byte: u8) { //* LoaD byte LD
@@ -234,10 +278,10 @@ impl Cpu {
         self.gpreg.v[vreg_x] = self.gpreg.v[vreg_y];
     }
     fn inst_add_byte(&mut self, vreg_x: usize, byte: u8) { //* ADD byte ADD
-        self.gpreg.v[vreg_x] += byte;
+        self.gpreg.v[vreg_x] = self.gpreg.v[vreg_x].wrapping_add(byte);
     }
     fn inst_add_reg(&mut self, vreg_x: usize, vreg_y: usize) { //* ADD reg ADD
-        self.gpreg.v[vreg_x] += self.gpreg.v[vreg_y];
+        self.gpreg.v[vreg_x] = self.gpreg.v[vreg_x].wrapping_add(self.gpreg.v[vreg_y]);
     }
     fn inst_or(&mut self, vreg_x: usize, vreg_y: usize) { //*bitwise OR operator OR
         self.gpreg.v[vreg_x] |= self.gpreg.v[vreg_y];
@@ -254,7 +298,7 @@ impl Cpu {
         } else {
             self.gpreg.v[0xF] = 1;
         }
-        self.gpreg.v[vreg_x] -= self.gpreg.v[vreg_y];
+        self.gpreg.v[vreg_x] = self.gpreg.v[vreg_x].wrapping_sub(self.gpreg.v[vreg_y]);
     }
     fn inst_subn(&mut self, vreg_x: usize, vreg_y: usize) {
         if self.gpreg.v[vreg_y] > self.gpreg.v[vreg_x] {
@@ -266,55 +310,87 @@ impl Cpu {
     }
     fn inst_shr(&mut self, vreg_x: usize) {
         self.gpreg.v[0xF] = self.gpreg.v[vreg_x] & 0b00000001;
-        self.gpreg.v[vreg_x] /= 2;
+        self.gpreg.v[vreg_x] = self.gpreg.v[vreg_x].wrapping_div(2);
     }
     fn inst_shl(&mut self, vreg_x: usize) {
         self.gpreg.v[0xF] = self.gpreg.v[vreg_x] & 0b10000000;
-        self.gpreg.v[vreg_x] *= 2;
+        self.gpreg.v[vreg_x] = self.gpreg.v[vreg_x].wrapping_mul(2); //TODO: what the fuck
     }
     fn inst_ldi(&mut self, addr: u16) {
         self.gpreg.i = addr;
     }
     fn inst_jpv0(&mut self, addr: u16) { //* JumP to addr+V0 JP V0
-        println!("JPV0");
+        //println!("JPV0");
         self.pc.set_as(addr + self.gpreg.v[0x0] as u16);
     }
     fn inst_rnd(&mut self, vreg_x: usize, byte: u8) {
         self.gpreg.v[vreg_x] = rand::random::<u8>() & byte;
     }
     fn inst_drw(&mut self, vreg_x: usize, vreg_y: usize, nibble: u8) {
-        let mut it: usize = 0;
-        while it < nibble as usize {
-            let x = vreg_x;
-            let mut y = vreg_y + it; //? Might have flipped this around idk yet, vertical mode in case hahaha
-            if y >= 8 {
-                y = 0;
+        let mut collision = false;
+        //let mut it: usize = 0;
+        for byte in 0..nibble {
+            for px in 0..8 {
+                let x = (self.gpreg.v[vreg_x].wrapping_add(px)) % SCREEN_WIDTH; //modulo only on x not px?
+                let y = (self.gpreg.v[vreg_y].wrapping_add(byte)) % SCREEN_HEIGHT;
+                let old_px = self.display_mem.pixels[y as usize][x as usize];
+                self.display_mem.pixels[y as usize][x as usize] ^= ((self.mem.data[(self.gpreg.i + byte as u16) as usize] >> (7 - px)) & 0b1) > 0;
+                //println!("{} {}", old_px, self.display_mem.pixels[y as usize][x as usize]);
+                if old_px && !self.display_mem.pixels[y as usize][x as usize] {
+                    collision = true;
+                }
             }
-            self.display_mem.pixels[x][y] = self.mem.data[self.gpreg.i as usize + it];
-            it += 1;
+        }
+
+        if collision {
+            self.gpreg.v[0xF] = 1;
+        } else {
+            self.gpreg.v[0xF] = 0;
         }
     }
-    fn inst_skp(&mut self, vreg_x: usize) { //* Skip Key Pressed
-        if self.kpad.keys & (1 << self.gpreg.v[vreg_x]) > 0 {
-            self.pc.incr_n(2);
+
+    fn inst_skp(&mut self, vreg_x: usize) { //* Skip Key Not Pressed
+        if ((self.kpad.keys >> self.gpreg.v[vreg_x]) & 0b1 > 0) {
+            self.pc.incr_n(1);
         }
     }
     fn inst_sknp(&mut self, vreg_x: usize) { //* Skip Key Not Pressed
-        if !self.kpad.keys & (1 << self.gpreg.v[vreg_x]) > 0 {
-            self.pc.incr_n(2);
+        if !((self.kpad.keys >> self.gpreg.v[vreg_x]) & 0b1 > 0) {
+            self.pc.incr_n(1);
         }
     }
     fn inst_ldvdt(&mut self, vreg_x: usize) {
         self.gpreg.v[vreg_x] = self.spreg.d;
     }
+    fn inst_ldk_diff(&mut self, vreg_x: usize) {
+        self.no_pc_incr = true;
+
+        if self.kpad_old.keys == 0 {
+            self.kpad_old.keys = self.kpad.keys;
+        } else {
+            if self.kpad.keys != self.kpad_old.keys {
+                let mut it = 0;
+                while it < 16 {
+                    if (self.kpad.keys >> it) & 0b1 > 0 {
+                        self.gpreg.v[vreg_x] = it;
+                        break;
+                    }
+                    it += 1;
+                }
+                self.no_pc_incr = false;
+                self.kpad_old.keys = 0;
+            }
+        }
+    }
     fn inst_ldk(&mut self, vreg_x: usize) {
-        let init_keys = self.kpad.keys;
-        while self.kpad.keys == init_keys {}
-        let mut it = 0;
-        while it < 16 {
-            if (self.kpad.keys >> it) > 0 {
-                self.gpreg.v[vreg_x] = it;
-                break;
+        if self.kpad.keys == 0 {
+            self.no_pc_incr = true;
+        } else {
+            for i in 0..16 {
+                if (self.kpad.keys >> i) & 0b1 > 0 {
+                    self.gpreg.v[vreg_x] = i;
+                    break;
+                }
             }
         }
     }
@@ -324,7 +400,7 @@ impl Cpu {
     fn inst_ldst(&mut self, vreg_x: usize) { //* LoaD reg in Sound Timer LDST
         self.spreg.s = self.gpreg.v[vreg_x];
     }
-    fn inst_addi(&mut self, vreg_x: usize, vreg_y: usize) { //* ADD reg ADD
+    fn inst_addi(&mut self, vreg_x: usize) { //* ADD reg ADD
         self.gpreg.i += self.gpreg.v[vreg_x] as u16;
     }
     fn inst_ldf(&mut self, vreg_x: usize) { //* LoaD Font LDF (loads the memory location of the character for the digit stored in Vx) */
@@ -339,12 +415,14 @@ impl Cpu {
         let mut it = 0;
         while it <= vreg_x {
             self.mem.data[(self.gpreg.i as usize) + it] = self.gpreg.v[it];
+            it += 1;
         }
     }
     fn inst_ldfm(&mut self, vreg_x: usize) { //* LD[I] Load from mem*/
         let mut it = 0;
         while it <= vreg_x {
             self.gpreg.v[it] = self.mem.data[(self.gpreg.i as usize) + it];
+            it += 1;
         }
     }
 
@@ -352,11 +430,13 @@ impl Cpu {
 
         //? SUS: check endianness sigh
         let opcode_digits_hex: [u8; 4] = [
-            self.opcode[0] & 0xF0 / 0x10,   //* Dxxx */
+            self.opcode[0] / 0x10,   //* Dxxx */
             self.opcode[0] & 0x0F,          //* xDxx */
-            self.opcode[1] & 0xF0 / 0x10,   //* xxDx */
+            self.opcode[1] / 0x10,   //* xxDx */
             self.opcode[1] & 0x0F,          //* xxxD */
         ];
+
+        //println!("opcode digits: {:x}|{:x}|{:x}|{:x}", opcode_digits_hex[0], opcode_digits_hex[1], opcode_digits_hex[2], opcode_digits_hex[3]);
 
         let opcode_as_u16: u16 = (self.opcode[0] as u16 * 0x100) + (self.opcode[1] as u16);
 
@@ -372,7 +452,7 @@ impl Cpu {
         match opcode_digits_hex[0] {
             0x0 => {
                 if opcode_as_u16 == 0x00E0 {
-                    println!("CLS opcode");
+                    //println!("CLS opcode");
                     self.inst_cls();
                 } else if opcode_as_u16 == 0x00EE {
                     self.inst_ret();
@@ -431,7 +511,7 @@ impl Cpu {
                         self.inst_shl(vreg_x);
                     },
                     _ => {
-                        println!("UNRECOGNISED OPCODE 0x{}", opcode_as_u16)
+                        //println!("UNRECOGNISED OPCODE 0x{:x}", opcode_as_u16)
                     }
                 }
             },
@@ -474,7 +554,7 @@ impl Cpu {
                         self.inst_ldst(vreg_x);
                     },
                     0x1E => {
-                        self.inst_addi(vreg_x, vreg_y);
+                        self.inst_addi(vreg_x);
                     },
                     0x29 => {
                         self.inst_ldf(vreg_x);
@@ -486,15 +566,15 @@ impl Cpu {
                         self.inst_ldtm(vreg_x);
                     },
                     0x65 => {
-                        self.inst_ldtm(vreg_x);
+                        self.inst_ldfm(vreg_x);
                     },
                     _ => {
-                        println!("UNRECOGNISED OPCODE 0x{}", opcode_as_u16)
+                        //println!("UNRECOGNISED OPCODE 0x{:x}", opcode_as_u16)
                     }
                 }
             },
             _ => {
-                println!("UNRECOGNISED OPCODE 0x{}", opcode_as_u16)
+                //println!("UNRECOGNISED OPCODE 0x{:x}", opcode_as_u16)
             }
         }
     }
@@ -506,34 +586,128 @@ impl Cpu {
 
     fn tick(&mut self) {
         self.read_opcode();
+        //println!("opcode: 0x{:2x}{:2x} | pc: 0x{:x} ", self.opcode[1], self.opcode[0], self.pc.get_cur());
         self.dispatch_operation();
-        self.pc.incr();
+        if self.no_pc_incr {
+            self.no_pc_incr = false;
+        } else {
+            self.pc.incr();
+        }
         self.display_mem.draw();
     }
 
-    fn load_rom(&mut self, rom: Memory){
-        self.mem = rom;
+    fn load_rom(&mut self, rom: Vec<u8>){
+        for i in 0..rom.len() {
+            self.mem.data[i + 0x200] = rom[i];
+            if i % 2 == 1 {
+                //println!("{:04x} || {:02x}{:02x} | {:08b} {:08b}", i-1+0x200, rom[i-1], rom[i], rom[i-1], rom[i]);
+            }
+        }
     }
 
     fn init_mem(&mut self) {
-        for b in 0..81 {
+        for b in 0..80 {
             self.mem.data[(FONT_START_MEM_LOCATION + b) as usize] = DEFAULT_FONT[b as usize];
         }
+    }
+
+    fn decr_timers(&mut self) {
+        if self.spreg.d > 0 {
+            self.spreg.d -= 1;
+        }
+        if self.spreg.s > 0 {
+            self.spreg.s -= 1;
+        }
+    }
+
+    fn push_keys(&mut self, new_keys: KeyPad) {
+        self.kpad.keys = new_keys.keys;
     }
 
 
 
 }
 
-fn file_to_rom(file: fs::File) -> Memory {
-    let mut buf: Vec<u8> = ;
-    let mut mem: Memory = Memory {data: [0; 4096]};
-    file.read_to_end(&mut buf);
-    for i in 0..4096 {
-        mem.data[i] = buf[i];
-    }
-    mem
+fn file_to_rom(filename: &str) -> Vec<u8> {
+    let res = fs::read(filename);
 
+    match res {
+        Ok(buf) => return buf,
+        Err(why) => println!("FS ERROR!! {}", why),
+    }
+    return Vec::new();
+
+}
+
+fn poll_keys() -> Result<KeyPad, std::io::Error> {
+    let mut new_state: KeyPad = KeyPad {
+        keys: 0
+    };
+
+    if poll(Duration::from_millis(1))? {
+
+        let event = read()?;
+
+        //println!("if event == Event::{:?}\r", event);
+
+            if event == Event::Key(KeyCode::Char('1').into()) {
+                new_state.keys += 1 << 0x1;
+            }
+            if event == Event::Key(KeyCode::Char('2').into()) {
+                new_state.keys += 1 << 0x2;
+            }
+            if event == Event::Key(KeyCode::Char('3').into()) {
+                new_state.keys += 1 << 0x3;
+            }
+            if event == Event::Key(KeyCode::Char('4').into()) {
+                new_state.keys += 1 << 0xC;
+            }
+            if event == Event::Key(KeyCode::Char('q').into()) {
+                new_state.keys += 1 << 0x4;
+            }
+            if event == Event::Key(KeyCode::Char('w').into()) {
+                new_state.keys += 1 << 0x5;
+            }
+            if event == Event::Key(KeyCode::Char('e').into()) {
+                new_state.keys += 1 << 0x6;
+            }
+            if event == Event::Key(KeyCode::Char('r').into()) {
+                new_state.keys += 1 << 0xD;
+            }
+            if event == Event::Key(KeyCode::Char('a').into()) {
+                new_state.keys += 1 << 0x7;
+            }
+            if event == Event::Key(KeyCode::Char('s').into()) {
+                new_state.keys += 1 << 0x8;
+            }
+            if event == Event::Key(KeyCode::Char('d').into()) {
+                new_state.keys += 1 << 0x9;
+            }
+            if event == Event::Key(KeyCode::Char('f').into()) {
+                new_state.keys += 1 << 0xe;
+            }
+            if event == Event::Key(KeyCode::Char('z').into()) {
+                new_state.keys += 1 << 0xA;
+            }
+            if event == Event::Key(KeyCode::Char('x').into()) {
+                new_state.keys += 1 << 0x0;
+            }
+            if event == Event::Key(KeyCode::Char('c').into()) {
+                new_state.keys += 1 << 0xB;
+            }
+            if event == Event::Key(KeyCode::Char('v').into()) {
+                new_state.keys += 1 << 0xF;
+            }
+            if event == Event::Key(KeyCode::Esc.into()) {
+                let _res = disable_raw_mode();
+                process::exit(0x00);
+            }
+
+        }
+        // It's guaranteed that read() won't block if `poll` returns `Ok(true)`
+    return Ok(KeyPad {keys: new_state.keys});
+
+    //Err(std::io::Error::new(io::ErrorKind::InvalidData, "nothing to poll"))
 }
 
 fn main() {
@@ -542,16 +716,41 @@ fn main() {
         gpreg: GPRegisters {v: [0; 16], i: 0},
         spreg: SPRegisters {d:0, s: 0},
         stack: StackData {data: [0; 16], pointer: 0},
-        pc: PC {c: 0},
+        pc: PC {c: 0x200},
         opcode: [0; 2],
-        display_mem: DisplayData {pixels: [[0; 8]; 128]},
+        display_mem: DisplayData {pixels: [[false; SCREEN_WIDTH as usize]; SCREEN_HEIGHT as usize]},
         kpad: KeyPad {keys: 0},
+        kpad_old: KeyPad {keys: 0},
+        no_pc_incr: false,
     };
+    let args: Vec<String> = env::args().collect();
+
+    if args.len() < 2 {
+        return;
+    }
+    mycpu.load_rom(file_to_rom(&args[1]));
+    mycpu.init_mem();
+
+    let mut cycles = 0;
+
+    let hz = 500;
+
 
     loop {
-        let begin = SystemTime::now();
+        cycles += 1;
+
+        let _res_raw = enable_raw_mode();
+        match poll_keys() {
+            Ok(keys) => mycpu.push_keys(keys),
+            Err(_err) => {},
+        }
+        let _res = disable_raw_mode();
+
         mycpu.tick();
-        let slp = Duration::from_millis(2);
+        let slp = Duration::from_millis(1000/hz);
         sleep(slp);
+        if cycles > (hz / 60) {
+            mycpu.decr_timers();
+        }
     }
 }
