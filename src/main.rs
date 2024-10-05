@@ -5,7 +5,7 @@ use std::thread::sleep;
 use std::env;
 
 use std::fs;
-use std::io;
+use std::io::{self, stdout};
 #[cfg(target_family = "unix")]
 use std::os::unix;
 
@@ -13,12 +13,18 @@ use std::io::Write;
 use std::process;
 
 
+use crossterm::event::{KeyEvent, KeyModifiers};
+use crossterm::execute;
 use rand::{random, SeedableRng};
 
 use crossterm::{
     ExecutableCommand, QueueableCommand,
     terminal, cursor, style::{self, Stylize},
-    Command, event::{poll, read, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
+    Command, event::{poll, read, DisableMouseCapture, EnableMouseCapture,
+        Event, Event::Key, KeyCode, KeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
+        PopKeyboardEnhancementFlags,
+        KeyEventKind},
     queue,
     terminal::{disable_raw_mode, enable_raw_mode},
 };
@@ -92,6 +98,29 @@ impl DisplayData {
         stdout.flush();
     }
 
+    fn diff_draw(&self, other: &DisplayData) {
+        let mut stdout = io::stdout();
+
+        let mut scr: String = "".to_string();
+        //stdout.execute(terminal::Clear(terminal::ClearType::All));
+
+        for y in 0..SCREEN_HEIGHT {
+            let mut line: String = "".to_string();
+            for x in 0..SCREEN_WIDTH {
+
+                if self.pixels[y as usize][x as usize] != other.pixels[y as usize][x as usize] {
+                    if self.pixels[y as usize][x as usize] {
+                        queue!(stdout, cursor::MoveTo(x as u16, y as u16), style::PrintStyledContent("██".blue()));
+                        //queue!(stdout, cursor::MoveTo(x,y), style::PrintStyledContent( "█".magenta()));
+                    } else {
+                        queue!(stdout, cursor::MoveTo(x as u16, y as u16), style::PrintStyledContent("  ".blue()));
+                    }
+                }
+            }
+        }
+        stdout.flush();
+    }
+
     fn draw(&self) {
         //self.print_display();
         self.crossterm_draw();
@@ -113,23 +142,13 @@ impl StackData {
     }
 
     fn push(&mut self, new_data: u16) -> Result<usize, usize>{
-        if self.pointer == 254 {
+        if self.pointer == 15 {
             return Err(self.pointer);
         }
         self.pointer += 1;
         self.data[self.pointer] = new_data;
      	return Ok(self.pointer);
     }
-}
-
-struct Sprite15 {
-    data: [u8; 15],
-    width: u8,
-}
-
-struct Sprite5 {
-    data: [u8; 5],
-    width: u8,
 }
 
 struct PC {
@@ -219,6 +238,7 @@ struct Cpu {
     pc: PC,
     opcode: [u8; 2],
     display_mem: DisplayData,
+    dp_old: DisplayData,
     kpad: KeyPad,
     kpad_old: KeyPad,
     no_pc_incr: bool,
@@ -281,40 +301,52 @@ impl Cpu {
         self.gpreg.v[vreg_x] = self.gpreg.v[vreg_x].wrapping_add(byte);
     }
     fn inst_add_reg(&mut self, vreg_x: usize, vreg_y: usize) { //* ADD reg ADD
+        let sumu16: u16 = (self.gpreg.v[vreg_x] as u16 + (self.gpreg.v[vreg_y] as u16));
         self.gpreg.v[vreg_x] = self.gpreg.v[vreg_x].wrapping_add(self.gpreg.v[vreg_y]);
+        if sumu16 > 0xFF {
+            self.gpreg.v[0xF] = 1;
+        } else {
+            self.gpreg.v[0xF] = 0;
+        }
     }
     fn inst_or(&mut self, vreg_x: usize, vreg_y: usize) { //*bitwise OR operator OR
         self.gpreg.v[vreg_x] |= self.gpreg.v[vreg_y];
+        self.gpreg.v[0xF] = 0; //quirk
     }
     fn inst_and(&mut self, vreg_x: usize, vreg_y: usize) {
         self.gpreg.v[vreg_x] &= self.gpreg.v[vreg_y];
+        self.gpreg.v[0xF] = 0; //quirk
     }
     fn inst_xor(&mut self, vreg_x: usize, vreg_y: usize) {
         self.gpreg.v[vreg_x] ^= self.gpreg.v[vreg_y];
+        self.gpreg.v[0xF] = 0; //quirk
     }
     fn inst_sub(&mut self, vreg_x: usize, vreg_y: usize) {
-        if self.gpreg.v[vreg_x] > self.gpreg.v[vreg_y] {
-            self.gpreg.v[0xF] = 1;
-        } else {
-            self.gpreg.v[0xF] = 1;
-        }
+        let mut vf = 0;
+        if self.gpreg.v[vreg_x] >= self.gpreg.v[vreg_y] {
+            vf = 1;
+        };
         self.gpreg.v[vreg_x] = self.gpreg.v[vreg_x].wrapping_sub(self.gpreg.v[vreg_y]);
+        self.gpreg.v[0xF] = vf;
     }
     fn inst_subn(&mut self, vreg_x: usize, vreg_y: usize) {
-        if self.gpreg.v[vreg_y] > self.gpreg.v[vreg_x] {
-            self.gpreg.v[0xF] = 1;
-        } else {
-            self.gpreg.v[0xF] = 1;
+        let mut vf = 0;
+        if self.gpreg.v[vreg_y] >= self.gpreg.v[vreg_x] {
+            vf = 1;
         }
-        self.gpreg.v[vreg_x] = self.gpreg.v[vreg_y] - self.gpreg.v[vreg_x];
+        self.gpreg.v[vreg_x] = self.gpreg.v[vreg_y].wrapping_sub(self.gpreg.v[vreg_x]);
+        self.gpreg.v[0xF] = vf;
     }
     fn inst_shr(&mut self, vreg_x: usize) {
-        self.gpreg.v[0xF] = self.gpreg.v[vreg_x] & 0b00000001;
-        self.gpreg.v[vreg_x] = self.gpreg.v[vreg_x].wrapping_div(2);
+        let vf = self.gpreg.v[vreg_x] & 0b00000001;
+        self.gpreg.v[vreg_x] = self.gpreg.v[vreg_x] >> 1;
+        self.gpreg.v[0xF] = vf;
     }
     fn inst_shl(&mut self, vreg_x: usize) {
-        self.gpreg.v[0xF] = self.gpreg.v[vreg_x] & 0b10000000;
-        self.gpreg.v[vreg_x] = self.gpreg.v[vreg_x].wrapping_mul(2); //TODO: what the fuck
+        let vf = (self.gpreg.v[vreg_x] & 0b10000000) >> 7;
+        self.gpreg.v[vreg_x] = self.gpreg.v[vreg_x] << 1;
+        self.gpreg.v[0xF] = vf;
+
     }
     fn inst_ldi(&mut self, addr: u16) {
         self.gpreg.i = addr;
@@ -330,9 +362,12 @@ impl Cpu {
         let mut collision = false;
         //let mut it: usize = 0;
         for byte in 0..nibble {
+            let y = self.gpreg.v[vreg_y].wrapping_add(byte) % SCREEN_HEIGHT;
+            /*if y > SCREEN_HEIGHT-1 {
+                break; //clipping is quirk
+            }*/
             for px in 0..8 {
                 let x = (self.gpreg.v[vreg_x].wrapping_add(px)) % SCREEN_WIDTH; //modulo only on x not px?
-                let y = (self.gpreg.v[vreg_y].wrapping_add(byte)) % SCREEN_HEIGHT;
                 let old_px = self.display_mem.pixels[y as usize][x as usize];
                 self.display_mem.pixels[y as usize][x as usize] ^= ((self.mem.data[(self.gpreg.i + byte as u16) as usize] >> (7 - px)) & 0b1) > 0;
                 //println!("{} {}", old_px, self.display_mem.pixels[y as usize][x as usize]);
@@ -362,7 +397,7 @@ impl Cpu {
     fn inst_ldvdt(&mut self, vreg_x: usize) {
         self.gpreg.v[vreg_x] = self.spreg.d;
     }
-    fn inst_ldk_diff(&mut self, vreg_x: usize) {
+    fn inst_ldk(&mut self, vreg_x: usize) {
         self.no_pc_incr = true;
 
         if self.kpad_old.keys == 0 {
@@ -382,7 +417,7 @@ impl Cpu {
             }
         }
     }
-    fn inst_ldk(&mut self, vreg_x: usize) {
+    fn inst_ldk_basic(&mut self, vreg_x: usize) {
         if self.kpad.keys == 0 {
             self.no_pc_incr = true;
         } else {
@@ -390,6 +425,23 @@ impl Cpu {
                 if (self.kpad.keys >> i) & 0b1 > 0 {
                     self.gpreg.v[vreg_x] = i;
                     break;
+                }
+            }
+        }
+    }
+    fn inst_ldk_overcomplex(&mut self, vreg_x: usize) {
+        while self.poll_keys().is_err() {}
+        for i in 0..16 {
+            if (self.kpad.keys >> i) & 0b1 > 0 {
+                self.gpreg.v[vreg_x] = i;
+                break;
+            }
+        }
+        loop {
+            while self.poll_keys().is_err() {}
+            for i in 0..16 {
+                if (self.kpad.keys >> self.gpreg.v[vreg_x]) & 0b1 == 0 {
+                    return;
                 }
             }
         }
@@ -412,17 +464,15 @@ impl Cpu {
         self.mem.data[self.gpreg.i as usize + 2] = self.gpreg.v[vreg_x] % 10;
     }
     fn inst_ldtm(&mut self, vreg_x: usize) { //* LD[I] Load to mem*/
-        let mut it = 0;
-        while it <= vreg_x {
-            self.mem.data[(self.gpreg.i as usize) + it] = self.gpreg.v[it];
-            it += 1;
+        for _i in 0..vreg_x+1 {
+            self.mem.data[self.gpreg.i as usize] = self.gpreg.v[_i];//incr i is quirk
+            self.gpreg.i += 1;
         }
     }
     fn inst_ldfm(&mut self, vreg_x: usize) { //* LD[I] Load from mem*/
-        let mut it = 0;
-        while it <= vreg_x {
-            self.gpreg.v[it] = self.mem.data[(self.gpreg.i as usize) + it];
-            it += 1;
+        for _i in 0..vreg_x+1 {
+            self.gpreg.v[_i] = self.mem.data[self.gpreg.i as usize]; //incr i is quirk
+            self.gpreg.i += 1;
         }
     }
 
@@ -584,18 +634,6 @@ impl Cpu {
         self.opcode[1] = self.mem.data[self.pc.get_cur() as usize + 1];
     }
 
-    fn tick(&mut self) {
-        self.read_opcode();
-        //println!("opcode: 0x{:2x}{:2x} | pc: 0x{:x} ", self.opcode[1], self.opcode[0], self.pc.get_cur());
-        self.dispatch_operation();
-        if self.no_pc_incr {
-            self.no_pc_incr = false;
-        } else {
-            self.pc.incr();
-        }
-        self.display_mem.draw();
-    }
-
     fn load_rom(&mut self, rom: Vec<u8>){
         for i in 0..rom.len() {
             self.mem.data[i + 0x200] = rom[i];
@@ -620,10 +658,165 @@ impl Cpu {
         }
     }
 
-    fn push_keys(&mut self, new_keys: KeyPad) {
-        self.kpad.keys = new_keys.keys;
+    fn poll_keys(&mut self) -> Result<KeyPad, std::io::Error> {
+        let _res_raw = enable_raw_mode();
+        if poll(Duration::from_millis(1))? {
+
+            match read()? {
+                Key(evt) => {
+                    //println!("code{} release? {}", evt.code, evt.kind == KeyEventKind::Release);
+                    match evt.code {
+                        KeyCode::Char('1') => {
+                            if evt.kind == KeyEventKind::Press {
+                                self.kpad.keys |= 1 << 0x1;
+                            } else if evt.kind == KeyEventKind::Release {
+                                self.kpad.keys &= !(1 << 0x1);
+                            }
+                        },
+                        KeyCode::Char('2') => {
+                            if evt.kind == KeyEventKind::Press {
+                                self.kpad.keys |= 1 << 0x2;
+                            } else if evt.kind == KeyEventKind::Release {
+                                self.kpad.keys &= !(1 << 0x2);
+                            }
+                        },
+                        KeyCode::Char('3') => {
+                            if evt.kind == KeyEventKind::Press {
+                                self.kpad.keys |= 1 << 0x3;
+                            } else if evt.kind == KeyEventKind::Release {
+                                self.kpad.keys &= !(1 << 0x3);
+                            }
+                        },
+                        KeyCode::Char('4') => {
+                            if evt.kind == KeyEventKind::Press {
+                                self.kpad.keys |= 1 << 0xC;
+                            } else if evt.kind == KeyEventKind::Release {
+                                self.kpad.keys &= !(1 << 0xC);
+                            }
+                        },
+                        KeyCode::Char('q') => {
+                            if evt.kind == KeyEventKind::Press {
+                                self.kpad.keys |= 1 << 0x4;
+                            } else if evt.kind == KeyEventKind::Release {
+                                self.kpad.keys &= !(1 << 0x4);
+                            }
+                        },
+                        KeyCode::Char('w') => {
+                            if evt.kind == KeyEventKind::Press {
+                                self.kpad.keys |= 1 << 0x5;
+                            } else if evt.kind == KeyEventKind::Release {
+                                self.kpad.keys &= !(1 << 0x5);
+                            }
+                        },
+                        KeyCode::Char('e') => {
+                            if evt.kind == KeyEventKind::Press {
+                                self.kpad.keys |= 1 << 0x6;
+                            } else if evt.kind == KeyEventKind::Release {
+                                self.kpad.keys &= !(1 << 0x6);
+                            }
+                        },
+                        KeyCode::Char('r') => {
+                            if evt.kind == KeyEventKind::Press {
+                                self.kpad.keys |= 1 << 0xD;
+                            } else if evt.kind == KeyEventKind::Release {
+                                self.kpad.keys &= !(1 << 0xD);
+                            }
+                        },
+                        KeyCode::Char('a') => {
+                            if evt.kind == KeyEventKind::Press {
+                                self.kpad.keys |= 1 << 0x7;
+                            } else if evt.kind == KeyEventKind::Release {
+                                self.kpad.keys &= !(1 << 0x7);
+                            }
+                        },
+                        KeyCode::Char('s') => {
+                            if evt.kind == KeyEventKind::Press {
+                                self.kpad.keys |= 1 << 0x8;
+                            } else if evt.kind == KeyEventKind::Release {
+                                self.kpad.keys &= !(1 << 0x8);
+                            }
+                        },
+                        KeyCode::Char('d') => {
+                            if evt.kind == KeyEventKind::Press {
+                                self.kpad.keys |= 1 << 0x9;
+                            } else if evt.kind == KeyEventKind::Release {
+                                self.kpad.keys &= !(1 << 0x9);
+                            }
+                        },
+                        KeyCode::Char('f') => {
+                            if evt.kind == KeyEventKind::Press {
+                                self.kpad.keys |= 1 << 0xE;
+                            } else if evt.kind == KeyEventKind::Release {
+                                self.kpad.keys &= !(1 << 0xE);
+                            }
+                        },
+                        KeyCode::Char('z') => {
+                            if evt.kind == KeyEventKind::Press {
+                                self.kpad.keys |= 1 << 0xA;
+                            } else if evt.kind == KeyEventKind::Release {
+                                self.kpad.keys &= !(1 << 0xA);
+                            }
+                        },
+                        KeyCode::Char('x') => {
+                            if evt.kind == KeyEventKind::Press {
+                                self.kpad.keys |= 1 << 0x0;
+                            } else if evt.kind == KeyEventKind::Release {
+                                self.kpad.keys &= !(1 << 0x0);
+                            }
+                        },
+                        KeyCode::Char('c') => {
+                            if evt.kind == KeyEventKind::Press {
+                                self.kpad.keys |= 1 << 0xB;
+                            } else if evt.kind == KeyEventKind::Release {
+                                self.kpad.keys &= !(1 << 0xB);
+                            }
+                        },
+                        KeyCode::Char('v') => {
+                            if evt.kind == KeyEventKind::Press {
+                                self.kpad.keys |= 1 << 0xF;
+                            } else if evt.kind == KeyEventKind::Release {
+                                self.kpad.keys &= !(1 << 0xF);
+                            }
+                        },
+                        KeyCode::Esc => {
+                            while disable_raw_mode().is_err() {}
+                            while execute!(stdout(), PopKeyboardEnhancementFlags).is_err() {}
+                            process::exit(0x00);
+                        },
+                        _ => {
+                            while disable_raw_mode().is_err() {}
+                            return Err(std::io::Error::new(io::ErrorKind::InvalidInput, ""));
+                        }
+                    }
+                    while disable_raw_mode().is_err() {}
+                    return Ok(KeyPad {keys: self.kpad.keys});
+                },
+                _ => {}
+            }
+
+        }
+        while disable_raw_mode().is_err() {}
+
+            // It's guaranteed that read() won't block if `poll` returns `Ok(true)`
+        return Err(std::io::Error::new(io::ErrorKind::InvalidInput, ""));
+
+        //Err(std::io::Error::new(io::ErrorKind::InvalidData, "nothing to poll"))
     }
 
+        fn tick(&mut self) {
+
+            let _poll = self.poll_keys();
+
+            self.read_opcode();
+            //println!("opcode: 0x{:2x}{:2x} | pc: 0x{:x} ", self.opcode[1], self.opcode[0], self.pc.get_cur());
+            self.dispatch_operation();
+            if self.no_pc_incr {
+                self.no_pc_incr = false;
+            } else {
+                self.pc.incr();
+            }
+            //self.display_mem.draw();
+        }
 
 
 }
@@ -639,77 +832,6 @@ fn file_to_rom(filename: &str) -> Vec<u8> {
 
 }
 
-fn poll_keys() -> Result<KeyPad, std::io::Error> {
-    let mut new_state: KeyPad = KeyPad {
-        keys: 0
-    };
-
-    if poll(Duration::from_millis(1))? {
-
-        let event = read()?;
-
-        //println!("if event == Event::{:?}\r", event);
-
-            if event == Event::Key(KeyCode::Char('1').into()) {
-                new_state.keys += 1 << 0x1;
-            }
-            if event == Event::Key(KeyCode::Char('2').into()) {
-                new_state.keys += 1 << 0x2;
-            }
-            if event == Event::Key(KeyCode::Char('3').into()) {
-                new_state.keys += 1 << 0x3;
-            }
-            if event == Event::Key(KeyCode::Char('4').into()) {
-                new_state.keys += 1 << 0xC;
-            }
-            if event == Event::Key(KeyCode::Char('q').into()) {
-                new_state.keys += 1 << 0x4;
-            }
-            if event == Event::Key(KeyCode::Char('w').into()) {
-                new_state.keys += 1 << 0x5;
-            }
-            if event == Event::Key(KeyCode::Char('e').into()) {
-                new_state.keys += 1 << 0x6;
-            }
-            if event == Event::Key(KeyCode::Char('r').into()) {
-                new_state.keys += 1 << 0xD;
-            }
-            if event == Event::Key(KeyCode::Char('a').into()) {
-                new_state.keys += 1 << 0x7;
-            }
-            if event == Event::Key(KeyCode::Char('s').into()) {
-                new_state.keys += 1 << 0x8;
-            }
-            if event == Event::Key(KeyCode::Char('d').into()) {
-                new_state.keys += 1 << 0x9;
-            }
-            if event == Event::Key(KeyCode::Char('f').into()) {
-                new_state.keys += 1 << 0xe;
-            }
-            if event == Event::Key(KeyCode::Char('z').into()) {
-                new_state.keys += 1 << 0xA;
-            }
-            if event == Event::Key(KeyCode::Char('x').into()) {
-                new_state.keys += 1 << 0x0;
-            }
-            if event == Event::Key(KeyCode::Char('c').into()) {
-                new_state.keys += 1 << 0xB;
-            }
-            if event == Event::Key(KeyCode::Char('v').into()) {
-                new_state.keys += 1 << 0xF;
-            }
-            if event == Event::Key(KeyCode::Esc.into()) {
-                let _res = disable_raw_mode();
-                process::exit(0x00);
-            }
-
-        }
-        // It's guaranteed that read() won't block if `poll` returns `Ok(true)`
-    return Ok(KeyPad {keys: new_state.keys});
-
-    //Err(std::io::Error::new(io::ErrorKind::InvalidData, "nothing to poll"))
-}
-
 fn main() {
     let mut mycpu = Cpu {
         mem: Memory {data: [0; 4096]},
@@ -719,37 +841,42 @@ fn main() {
         pc: PC {c: 0x200},
         opcode: [0; 2],
         display_mem: DisplayData {pixels: [[false; SCREEN_WIDTH as usize]; SCREEN_HEIGHT as usize]},
+        dp_old: DisplayData {pixels: [[false; SCREEN_WIDTH as usize]; SCREEN_HEIGHT as usize]},
         kpad: KeyPad {keys: 0},
         kpad_old: KeyPad {keys: 0},
         no_pc_incr: false,
     };
     let args: Vec<String> = env::args().collect();
+    stdout().execute(terminal::Clear(terminal::ClearType::All));
 
     if args.len() < 2 {
         return;
     }
+
     mycpu.load_rom(file_to_rom(&args[1]));
     mycpu.init_mem();
 
+    execute!(
+        stdout(),
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+        )
+    );
+
     let mut cycles = 0;
 
-    let hz = 500;
+    let hz = 300;
 
 
     loop {
         cycles += 1;
-
-        let _res_raw = enable_raw_mode();
-        match poll_keys() {
-            Ok(keys) => mycpu.push_keys(keys),
-            Err(_err) => {},
-        }
-        let _res = disable_raw_mode();
-
         mycpu.tick();
         let slp = Duration::from_millis(1000/hz);
         sleep(slp);
         if cycles > (hz / 60) {
+            mycpu.display_mem.draw();
+            //mycpu.display_mem.diff_draw(&mycpu.dp_old);
+            mycpu.dp_old.pixels = mycpu.display_mem.pixels;
             mycpu.decr_timers();
         }
     }
